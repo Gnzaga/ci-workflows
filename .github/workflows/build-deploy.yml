@@ -2,7 +2,9 @@
 #
 # Two jobs with different trust levels:
 #   build   GitHub-hosted ubuntu-latest. Builds and pushes images to GHCR using
-#           GITHUB_TOKEN. No environment, no deploy secrets.
+#           GITHUB_TOKEN. No environment, no deploy secrets. Always runs, but its
+#           build steps are skipped when prebuilt-digests is set or images is []; in
+#           those cases it only validates and passes digests through as its output.
 #   deploy  ARC runner inside the cluster (LAN reach, Flannel does not enforce
 #           NetworkPolicy). Runs only after build succeeds, uses the caller repo's
 #           `production` environment, and only ever sees digests produced by build.
@@ -27,9 +29,13 @@ on:
         type: string
         required: true
       images:
-        description: 'JSON list: [{"name","context","dockerfile","build-args","manifest-image"}]; paths relative to repo root. name is the GHCR package name under gnzaga/. manifest-image is the image name as written in the app manifests (optional, defaults to the pull ref)'
+        description: 'JSON list: [{"name","context","dockerfile","build-args","manifest-image"}]; paths relative to repo root. name is the GHCR package name under gnzaga/. manifest-image is the image name as written in the app manifests (optional, defaults to the pull ref). Use [] for deploy-only mode (requires deploy-target argocd and empty prebuilt-digests); required when prebuilt-digests is set'
         type: string
         required: true
+      prebuilt-digests:
+        description: 'JSON list of ghcr.io/gnzaga/<name>@sha256:<digest> refs from an earlier build-deploy call (its digests output). When set, nothing is built; the deploy job uses these digests. images is still required for name and manifest-image mapping'
+        type: string
+        default: ""
       pull-prefix:
         description: "Registry prefix cluster nodes pull through; GHCR refs are written as <pull-prefix>/gnzaga/<name>@sha256:..."
         type: string
@@ -58,6 +64,10 @@ on:
         description: "Komodo core API base URL reachable from the runner"
         type: string
         default: http://192.168.42.27:9120
+    outputs:
+      digests:
+        description: "JSON list of ghcr.io/gnzaga/<name>@sha256:<digest> refs: the images built by this call, or the prebuilt-digests passthrough. Feed to a second call's prebuilt-digests."
+        value: ${{ jobs.build.outputs.digests }}
 
 permissions:
   contents: read
@@ -72,6 +82,7 @@ jobs:
     env:
       APP: ${{ inputs.app }}
       IMAGES: ${{ inputs.images }}
+      PREBUILT_DIGESTS: ${{ inputs.prebuilt-digests }}
       DEPLOY_TARGET: ${{ inputs.deploy-target }}
       KOMODO_STACK: ${{ inputs.komodo-stack }}
       COMPOSE_FILE: ${{ inputs.compose-file }}
@@ -79,13 +90,8 @@ jobs:
       REPO_SLUG: ${{ github.repository }}
       REPO_SHA: ${{ github.sha }}
     outputs:
-      digests: ${{ steps.build.outputs.digests }}
+      digests: ${{ inputs.prebuilt-digests || steps.build.outputs.digests }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
       - name: Validate inputs
         run: |
           set -euo pipefail
@@ -98,17 +104,37 @@ jobs:
               ;;
             *) echo "::error::deploy-target must be argocd, komodo or none (got: ${DEPLOY_TARGET})"; exit 1 ;;
           esac
-          jq -e 'type == "array" and length > 0 and all(.[];
-            (.name | type == "string" and test("^[a-z0-9]+([._-][a-z0-9]+)*$")) and
-            (.context | type == "string" and length > 0) and
-            (.dockerfile | type == "string" and length > 0) and
-            ((."manifest-image" // "x") | type == "string" and length > 0))' <<<"$IMAGES" >/dev/null \
-            || { echo "::error::images must be a non-empty JSON array of {name, context, dockerfile[, build-args, manifest-image]} with lowercase names"; exit 1; }
+          if [ "$(jq -c . <<<"$IMAGES")" = "[]" ]; then
+            [ "$DEPLOY_TARGET" = argocd ] && [ -z "$PREBUILT_DIGESTS" ] \
+              || { echo "::error::images may be [] only with deploy-target argocd and empty prebuilt-digests"; exit 1; }
+          else
+            jq -e 'type == "array" and length > 0 and all(.[];
+              (.name | type == "string" and test("^[a-z0-9]+([._-][a-z0-9]+)*$")) and
+              (.context | type == "string" and length > 0) and
+              (.dockerfile | type == "string" and length > 0) and
+              ((."manifest-image" // "x") | type == "string" and length > 0))' <<<"$IMAGES" >/dev/null \
+              || { echo "::error::images must be a non-empty JSON array of {name, context, dockerfile[, build-args, manifest-image]} with lowercase names, or [] for deploy-only"; exit 1; }
+          fi
+          if [ -n "$PREBUILT_DIGESTS" ]; then
+            [ "$(jq -c . <<<"$IMAGES")" != "[]" ] \
+              || { echo "::error::prebuilt-digests requires images (name and manifest-image mapping)"; exit 1; }
+            jq -e 'type == "array" and length > 0 and all(.[];
+              type == "string" and test("^ghcr\\.io/gnzaga/[a-z0-9]+([._-][a-z0-9]+)*@sha256:[0-9a-f]{64}$"))' <<<"$PREBUILT_DIGESTS" >/dev/null \
+              || { echo "::error::prebuilt-digests must be a non-empty JSON array of ghcr.io/gnzaga/<name>@sha256:<64 hex> strings"; exit 1; }
+          fi
+
+      - name: Checkout
+        if: inputs.prebuilt-digests == '' && inputs.images != '[]'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Buildx
+        if: inputs.prebuilt-digests == '' && inputs.images != '[]'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
+        if: inputs.prebuilt-digests == '' && inputs.images != '[]'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -117,6 +143,7 @@ jobs:
 
       - name: Build and push images
         id: build
+        if: inputs.prebuilt-digests == '' && inputs.images != '[]'
         run: |
           set -euo pipefail
           t0=$(date +%s)
@@ -182,6 +209,7 @@ jobs:
       DIGESTS: ${{ needs.build.outputs.digests }}
       PULL_PREFIX: ${{ inputs.pull-prefix }}
       GHCR_OWNER: gnzaga
+      DEPLOY_TARGET: ${{ inputs.deploy-target }}
       HOMELAB_APP_FILE_TEMPLATE: ${{ inputs.homelab-app-file }}
       ARGOCD_SERVER: ${{ inputs.argocd-server }}
       KOMODO_STACK: ${{ inputs.komodo-stack }}
@@ -195,7 +223,11 @@ jobs:
           set -euo pipefail
           file="${HOMELAB_APP_FILE_TEMPLATE//\$\{app\}/$APP}"
           echo "HOMELAB_APP_FILE=${file}" >> "$GITHUB_ENV"
-          echo "Target Application file: ${file}"
+          if [ "$DEPLOY_TARGET" = komodo ]; then
+            echo "Target compose file: ${COMPOSE_FILE}"
+          else
+            echo "Target Application file: ${file}"
+          fi
           [[ -n "$PULL_PREFIX" && "$PULL_PREFIX" != */ ]] || { echo "::error::pull-prefix must be non-empty with no trailing slash"; exit 1; }
           refs="$RUNNER_TEMP/refs.tsv"
           : > "$refs"
@@ -216,6 +248,7 @@ jobs:
 
       - name: Mint deployer token
         id: deployer
+        if: inputs.images != '[]'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.DEPLOYER_APP_ID }}
@@ -225,7 +258,7 @@ jobs:
 
       - name: Commit digests to homelab
         id: commit
-        if: inputs.deploy-target == 'argocd'
+        if: inputs.deploy-target == 'argocd' && inputs.images != '[]'
         env:
           DEPLOYER_TOKEN: ${{ steps.deployer.outputs.token }}
         run: |
@@ -312,7 +345,7 @@ jobs:
           printf 'commit\t%s\n' "$(( $(date +%s) - t0 ))" >> "$RUNNER_TEMP/timings.tsv"
 
       - name: Sync ArgoCD and wait for health
-        if: inputs.deploy-target == 'argocd'
+        if: inputs.deploy-target == 'argocd' && inputs.images != '[]'
         env:
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
         run: |
@@ -368,6 +401,30 @@ jobs:
             echo "::error::ArgoCD did not pick up the new digests for ${APP} within 120s"
             exit 1
           fi
+
+          "${acd[@]}" app sync "$APP"
+          "${acd[@]}" app wait "$APP" --sync --health --timeout 600
+          printf 'argocd\t%s\n' "$(( $(date +%s) - t0 ))" >> "$RUNNER_TEMP/timings.tsv"
+
+      - name: Sync ArgoCD app and wait for health (deploy-only)
+        if: inputs.deploy-target == 'argocd' && inputs.images == '[]'
+        env:
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          bindir="$RUNNER_TEMP/bin"
+          mkdir -p "$bindir"
+          ARGOCD_VERSION=v3.2.5
+          base="https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}"
+          curl -fsSL -o "$bindir/argocd" "$base/argocd-linux-amd64"
+          curl -fsSL -o "$RUNNER_TEMP/argocd-checksums.txt" "$base/cli_checksums.txt"
+          sha=$(awk '$2 == "argocd-linux-amd64" {print $1}' "$RUNNER_TEMP/argocd-checksums.txt")
+          [ -n "$sha" ] || { echo "::error::argocd SHA-256 not found in checksums"; exit 1; }
+          echo "$sha  $bindir/argocd" | sha256sum -c -
+          chmod 0755 "$bindir/argocd"
+          export PATH="$bindir:$PATH"
+          acd=(argocd --server "$ARGOCD_SERVER" --plaintext --grpc-web --auth-token "$ARGOCD_AUTH_TOKEN")
 
           "${acd[@]}" app sync "$APP"
           "${acd[@]}" app wait "$APP" --sync --health --timeout 600

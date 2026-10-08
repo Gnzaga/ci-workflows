@@ -58,6 +58,54 @@ jobs:
 
 `komodo-url` defaults to `http://192.168.42.27:9120`.
 
+### Deploy-only mode
+
+`images: '[]'` with `deploy-target: argocd` skips the build and the homelab commit. The deploy job only runs `argocd app sync <app>` and `app wait --sync --health`, so the Application gets a GitHub Deployment and a health result without pushing images. Use it for manifest-only repos. `[]` is rejected with any other deploy target, and when `prebuilt-digests` is set.
+
+```yaml
+jobs:
+  deploy:
+    needs: ci
+    uses: Gnzaga/ci-workflows/.github/workflows/build-deploy.yml@v1
+    with:
+      app: <argocd-application>
+      images: '[]'
+    secrets: inherit
+```
+
+### Prebuilt digests and multi-target deploys
+
+The `digests` workflow output lists the `ghcr.io/gnzaga/<name>@sha256:…` refs built by a call. Pass it as `prebuilt-digests` to a second call to deploy the same images to another target without rebuilding. `prebuilt-digests` requires `images` (for name and `manifest-image` mapping) and skips the build steps.
+
+```yaml
+jobs:
+  k8s:
+    uses: Gnzaga/ci-workflows/.github/workflows/build-deploy.yml@v1
+    with: { app: bellegunz, images: '[...]' }
+  fredo:
+    needs: k8s
+    uses: Gnzaga/ci-workflows/.github/workflows/build-deploy.yml@v1
+    with:
+      app: bellegunz-fredo
+      deploy-target: komodo
+      komodo-stack: bellegunz
+      compose-file: stacks/fredo/bellegunz/compose.yml
+      images: '[...]'
+      prebuilt-digests: ${{ needs.k8s.outputs.digests }}
+    secrets: inherit
+```
+
+Both deploy jobs use the `production` environment, so they can run in the same workflow run.
+
+### Mode truth table
+
+| Mode | `images` | `prebuilt-digests` | `deploy-target` | Build steps | Deploy job | Homelab commit | ArgoCD / Komodo |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| normal argocd | non-empty | empty | `argocd` | run | runs | yes | `homelab-apps` sync, digest poll, `app sync`, `app wait` |
+| normal komodo | non-empty | empty | `komodo` | run | runs | compose file | `DeployStack`, poll Update |
+| prebuilt | non-empty | set | `argocd` or `komodo` | skipped | runs with passthrough digests | as above | as above |
+| deploy-only | `[]` | empty | `argocd` | skipped | runs | none | `app sync`, `app wait` |
+
 ## Operator scripts
 
 Run locally with `gh` authenticated as Gnzaga. `setup-production-env.sh` also needs `vault`. Both accept `--dry-run`, which makes no calls.
