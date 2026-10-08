@@ -1,0 +1,378 @@
+# Reusable build-and-deploy workflow.
+#
+# Two jobs with different trust levels:
+#   build   GitHub-hosted ubuntu-latest. Builds and pushes images to GHCR using
+#           GITHUB_TOKEN. No environment, no deploy secrets.
+#   deploy  ARC runner inside the cluster (LAN reach, Flannel does not enforce
+#           NetworkPolicy). Runs only after build succeeds, uses the caller repo's
+#           `production` environment, and only ever sees digests produced by build.
+#
+# Trust model: call this workflow only with code that has been reviewed and merged
+# to the deploy branch. Never call it from `pull_request`, from forks, or from any
+# workflow triggered by untrusted input. Deploy secrets come from the caller repo's
+# `production` environment, which is restricted to the deploy branch.
+#
+# Flow: buildx -> push ghcr.io/gnzaga/<name>:<sha> -> digests -> (deploy job)
+# write Harbor pull-cache refs to homelab.git (deployer App token) -> ArgoCD sync
+# and health wait.
+name: build-deploy
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: "ArgoCD Application name (also the homelab apps file stem)"
+        type: string
+        required: true
+      images:
+        description: 'JSON list: [{"name","context","dockerfile","build-args","manifest-image"}]; paths relative to repo root. name is the GHCR package name under gnzaga/. manifest-image is the image name as written in the app manifests (optional, defaults to the pull ref)'
+        type: string
+        required: true
+      pull-prefix:
+        description: "Registry prefix cluster nodes pull through; GHCR refs are written as <pull-prefix>/gnzaga/<name>@sha256:..."
+        type: string
+        default: harbor.gnzaga.com/ghcr
+      homelab-app-file:
+        description: 'Application file path in homelab.git; the literal ${app} is replaced with the app input'
+        type: string
+        default: "deployment-library/k8s/gitops/apps/${app}.yaml"
+      argocd-server:
+        description: "ArgoCD API server reachable from the runner (host:port)"
+        type: string
+        default: argocd-server.argocd.svc
+      deploy-target:
+        description: "argocd: deploy job commits digests to homelab.git and syncs ArgoCD. none: build and push only (deploy job skipped)"
+        type: string
+        default: argocd
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      APP: ${{ inputs.app }}
+      IMAGES: ${{ inputs.images }}
+      DEPLOY_TARGET: ${{ inputs.deploy-target }}
+      GHCR_OWNER: gnzaga
+      REPO_SLUG: ${{ github.repository }}
+      REPO_SHA: ${{ github.sha }}
+    outputs:
+      digests: ${{ steps.build.outputs.digests }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [[ "$APP" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || { echo "::error::invalid app name: ${APP}"; exit 1; }
+          case "$DEPLOY_TARGET" in
+            argocd|none) ;;
+            *) echo "::error::deploy-target must be argocd or none (got: ${DEPLOY_TARGET})"; exit 1 ;;
+          esac
+          jq -e 'type == "array" and length > 0 and all(.[];
+            (.name | type == "string" and test("^[a-z0-9]+([._-][a-z0-9]+)*$")) and
+            (.context | type == "string" and length > 0) and
+            (.dockerfile | type == "string" and length > 0) and
+            ((."manifest-image" // "x") | type == "string" and length > 0))' <<<"$IMAGES" >/dev/null \
+            || { echo "::error::images must be a non-empty JSON array of {name, context, dockerfile[, build-args, manifest-image]} with lowercase names"; exit 1; }
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push images
+        id: build
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          work="$RUNNER_TEMP/build"
+          mkdir -p "$work"
+          : > "$work/refs.txt"
+          while IFS= read -r img; do
+            name=$(jq -r '.name' <<<"$img")
+            context=$(jq -r '.context' <<<"$img")
+            dockerfile=$(jq -r '.dockerfile' <<<"$img")
+            args=()
+            while IFS= read -r ba; do
+              if [ -n "$ba" ]; then args+=(--build-arg "$ba"); fi
+            done < <(jq -r '(."build-args" // "") | split("\n") | .[]' <<<"$img")
+            ref="ghcr.io/${GHCR_OWNER}/${name}"
+            meta="$work/meta-${name}.json"
+            echo "::group::build ${name}"
+            docker buildx build "$context" -f "$dockerfile" "${args[@]}" \
+              --platform linux/amd64 \
+              --tag "${ref}:${REPO_SHA}" \
+              --label "org.opencontainers.image.source=https://github.com/${REPO_SLUG}" \
+              --cache-from "type=gha,scope=${name}" \
+              --cache-to "type=gha,scope=${name},mode=max" \
+              --push --metadata-file "$meta" </dev/null
+            echo "::endgroup::"
+            digest=$(jq -r '."containerimage.digest"' "$meta")
+            if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+              echo "::error::no digest produced for ${name}"
+              exit 1
+            fi
+            echo "${ref}@${digest}" >> "$work/refs.txt"
+          done < <(jq -c '.[]' <<<"$IMAGES")
+          digests=$(jq -R -s -c 'split("\n") | map(select(length > 0))' "$work/refs.txt")
+          echo "digests=${digests}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Build ${APP}"
+            echo
+            echo "| Image | Digest |"
+            echo "| --- | --- |"
+            while IFS= read -r ref; do
+              echo "| \`${ref%@*}\` | \`${ref#*@}\` |"
+            done < "$work/refs.txt"
+            echo
+            echo "Build and push: $(( $(date +%s) - t0 ))s"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    if: inputs.deploy-target == 'argocd'
+    needs: build
+    runs-on: arc-${{ github.event.repository.name }}
+    environment:
+      name: production
+      url: https://argocd.gnzaga.com/applications/argocd/${{ inputs.app }}
+    timeout-minutes: 30
+    concurrency:
+      group: deploy-${{ inputs.app }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      APP: ${{ inputs.app }}
+      IMAGES: ${{ inputs.images }}
+      DIGESTS: ${{ needs.build.outputs.digests }}
+      PULL_PREFIX: ${{ inputs.pull-prefix }}
+      GHCR_OWNER: gnzaga
+      HOMELAB_APP_FILE_TEMPLATE: ${{ inputs.homelab-app-file }}
+      ARGOCD_SERVER: ${{ inputs.argocd-server }}
+      REPO_NAME: ${{ github.event.repository.name }}
+      REPO_SHA: ${{ github.sha }}
+    steps:
+      - name: Map built images to pull refs
+        run: |
+          set -euo pipefail
+          file="${HOMELAB_APP_FILE_TEMPLATE//\$\{app\}/$APP}"
+          echo "HOMELAB_APP_FILE=${file}" >> "$GITHUB_ENV"
+          echo "Target Application file: ${file}"
+          [[ -n "$PULL_PREFIX" && "$PULL_PREFIX" != */ ]] || { echo "::error::pull-prefix must be non-empty with no trailing slash"; exit 1; }
+          refs="$RUNNER_TEMP/refs.tsv"
+          : > "$refs"
+          while IFS= read -r img; do
+            name=$(jq -r '.name' <<<"$img")
+            manifest=$(jq -r '."manifest-image" // empty' <<<"$img")
+            built=$(jq -r --arg p "ghcr.io/${GHCR_OWNER}/${name}@" '.[] | select(startswith($p))' <<<"$DIGESTS")
+            if [ -z "$built" ]; then
+              echo "::error::no digest built for ${name}"
+              exit 1
+            fi
+            digest="${built#*@}"
+            new="${PULL_PREFIX}/${GHCR_OWNER}/${name}@${digest}"
+            [ -n "$manifest" ] || manifest="${PULL_PREFIX}/${GHCR_OWNER}/${name}"
+            printf '%s\t%s\t%s\n' "$manifest" "$new" "${name}@${digest:7:12}" >> "$refs"
+          done < <(jq -c '.[]' <<<"$IMAGES")
+          cat "$refs"
+
+      - name: Mint deployer token
+        id: deployer
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.DEPLOYER_APP_ID }}
+          private-key: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+          owner: Gnzaga
+          repositories: homelab
+
+      - name: Commit digests to homelab
+        id: commit
+        env:
+          DEPLOYER_TOKEN: ${{ steps.deployer.outputs.token }}
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          echo "::add-mask::${DEPLOYER_TOKEN}"
+
+          bindir="$RUNNER_TEMP/bin"
+          mkdir -p "$bindir"
+          YQ_VERSION=v4.54.1
+          if ! { command -v yq >/dev/null 2>&1 && yq --version 2>/dev/null | grep -q 'mikefarah/yq.*version v4'; }; then
+            base="https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}"
+            curl -fsSL -o "$bindir/yq" "$base/yq_linux_amd64"
+            curl -fsSL -o "$RUNNER_TEMP/yq-checksums" "$base/checksums"
+            sha=$(awk '$1 == "yq_linux_amd64" {print $19}' "$RUNNER_TEMP/yq-checksums")
+            [ -n "$sha" ] || { echo "::error::yq SHA-256 not found in checksums"; exit 1; }
+            echo "$sha  $bindir/yq" | sha256sum -c -
+            chmod 0755 "$bindir/yq"
+            export PATH="$bindir:$PATH"
+          fi
+
+          repo_dir="$RUNNER_TEMP/homelab"
+          git clone --depth 1 "https://x-access-token:${DEPLOYER_TOKEN}@github.com/Gnzaga/homelab.git" "$repo_dir"
+          cd "$repo_dir"
+          git config user.name "gnzaga-deployer[bot]"
+          git config user.email "noreply@github.com"
+
+          file="$HOMELAB_APP_FILE"
+          if [ ! -f "$file" ]; then
+            echo "::error::${file} not found in homelab.git"
+            exit 1
+          fi
+          count=$(yq 'select(.kind == "Application" and .metadata.name == strenv(APP)) | .metadata.name' "$file" | grep -c . || true)
+          if [ "$count" != "1" ]; then
+            echo "::error::expected exactly one Application named ${APP} in ${file}, found ${count}"
+            exit 1
+          fi
+
+          parts=()
+          while IFS=$'\t' read -r manifest new label; do
+            parts+=("$label")
+            # Escape regex metacharacters so the prefix match is exact.
+            pat=$(printf '%s' "$manifest" | sed 's|[][\.*^$/]|\\&|g')
+            export PAT="$pat" NEW="${manifest}=${new}"
+            yq -i '
+              with(select(.kind == "Application" and .metadata.name == strenv(APP));
+                .spec.source.kustomize.images = (
+                  ((.spec.source.kustomize.images // []) | map(select(
+                    test("^" + strenv(PAT) + "[@:=]") | not
+                  ))) + [strenv(NEW)]
+                )
+              )' "$file"
+          done < "$RUNNER_TEMP/refs.tsv"
+
+          if git diff --quiet -- "$file"; then
+            echo "No digest change for ${APP}; nothing to commit"
+          else
+            git add -- "$file"
+            joined=""
+            for p in "${parts[@]}"; do joined+="${joined:+, }${p}"; done
+            msg="deploy(${APP}): ${joined} from ${REPO_NAME}@${REPO_SHA:0:7}"
+            git commit -q -m "$msg"
+            branch=$(git rev-parse --abbrev-ref HEAD)
+            pushed=0
+            for attempt in 1 2 3; do
+              if git push -q origin "HEAD:refs/heads/${branch}"; then
+                pushed=1
+                break
+              fi
+              echo "push attempt ${attempt} rejected; rebasing onto origin/${branch}"
+              if ! git pull -q --rebase origin "$branch"; then
+                git rebase --abort 2>/dev/null || true
+                echo "::error::rebase onto origin/${branch} failed"
+                exit 1
+              fi
+            done
+            if [ "$pushed" != 1 ]; then
+              echo "::error::push to homelab failed after 3 attempts"
+              exit 1
+            fi
+          fi
+
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          printf 'commit\t%s\n' "$(( $(date +%s) - t0 ))" >> "$RUNNER_TEMP/timings.tsv"
+
+      - name: Sync ArgoCD and wait for health
+        env:
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          bindir="$RUNNER_TEMP/bin"
+          mkdir -p "$bindir"
+          ARGOCD_VERSION=v3.2.5
+          base="https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}"
+          curl -fsSL -o "$bindir/argocd" "$base/argocd-linux-amd64"
+          curl -fsSL -o "$RUNNER_TEMP/argocd-checksums.txt" "$base/cli_checksums.txt"
+          sha=$(awk '$2 == "argocd-linux-amd64" {print $1}' "$RUNNER_TEMP/argocd-checksums.txt")
+          [ -n "$sha" ] || { echo "::error::argocd SHA-256 not found in checksums"; exit 1; }
+          echo "$sha  $bindir/argocd" | sha256sum -c -
+          chmod 0755 "$bindir/argocd"
+          export PATH="$bindir:$PATH"
+          acd=(argocd --server "$ARGOCD_SERVER" --grpc-web --insecure --auth-token "$ARGOCD_AUTH_TOKEN")
+
+          "${acd[@]}" app get homelab-apps --refresh >/dev/null
+          synced=0
+          for attempt in 1 2 3 4 5; do
+            if out=$("${acd[@]}" app sync homelab-apps --async 2>&1); then
+              synced=1
+              break
+            fi
+            echo "$out"
+            if grep -qi 'another operation is already in progress' <<<"$out"; then
+              echo "homelab-apps busy (attempt ${attempt}); retrying in 10s"
+              sleep 10
+            else
+              exit 1
+            fi
+          done
+          if [ "$synced" != 1 ]; then
+            echo "::error::homelab-apps still busy after 5 attempts"
+            exit 1
+          fi
+
+          ok=0
+          for _ in $(seq 1 24); do
+            current=$("${acd[@]}" app get "$APP" -o json | jq -r '(.spec.source.kustomize.images // [])[]')
+            missing=0
+            while IFS=$'\t' read -r manifest new _; do
+              grep -qxF "${manifest}=${new}" <<<"$current" || missing=1
+            done < "$RUNNER_TEMP/refs.tsv"
+            if [ "$missing" = 0 ]; then
+              ok=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error::ArgoCD did not pick up the new digests for ${APP} within 120s"
+            exit 1
+          fi
+
+          "${acd[@]}" app sync "$APP"
+          "${acd[@]}" app wait "$APP" --sync --health --timeout 600
+          printf 'argocd\t%s\n' "$(( $(date +%s) - t0 ))" >> "$RUNNER_TEMP/timings.tsv"
+
+      - name: Job summary
+        if: always()
+        env:
+          HOMELAB_COMMIT: ${{ steps.commit.outputs.sha }}
+        run: |
+          {
+            echo "## Deploy ${APP}"
+            echo
+            echo "| Image | Digest |"
+            echo "| --- | --- |"
+            if [ -s "$RUNNER_TEMP/refs.tsv" ]; then
+              while IFS=$'\t' read -r _ new _; do
+                echo "| \`${new%@*}\` | \`${new#*@}\` |"
+              done < "$RUNNER_TEMP/refs.tsv"
+            fi
+            echo
+            echo "| Step | Seconds |"
+            echo "| --- | --- |"
+            if [ -s "$RUNNER_TEMP/timings.tsv" ]; then
+              while IFS=$'\t' read -r step secs; do
+                echo "| ${step} | ${secs} |"
+              done < "$RUNNER_TEMP/timings.tsv"
+            fi
+            echo
+            if [ -n "$HOMELAB_COMMIT" ]; then
+              echo "Homelab commit: https://github.com/Gnzaga/homelab/commit/${HOMELAB_COMMIT}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

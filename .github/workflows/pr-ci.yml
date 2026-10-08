@@ -1,0 +1,117 @@
+# Reusable PR CI workflow.
+#
+# Trust model: runs untrusted code (pull request heads, agent-authored branches)
+# on GitHub-hosted runners. No secrets are referenced in this file. Images are
+# built for verification only and are never pushed.
+#
+# Caller job id must be `ci` so the required status check is `ci / ci`.
+name: pr-ci
+
+on:
+  workflow_call:
+    inputs:
+      runtime:
+        description: "Language runtime to set up: node, python or none"
+        type: string
+        default: none
+      runtime-version:
+        description: "Runtime version (required when runtime is node or python)"
+        type: string
+        default: ""
+      workdir:
+        description: "Directory for install and test commands (relative to repo root)"
+        type: string
+        default: "."
+      install-command:
+        description: "Dependency install command, run in workdir; empty skips"
+        type: string
+        default: ""
+      test-command:
+        description: "Test command, run in workdir; empty skips"
+        type: string
+        default: ""
+      images:
+        description: 'JSON list: [{"name","context","dockerfile","build-args"}]; paths relative to repo root'
+        type: string
+        default: "[]"
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      RUNTIME: ${{ inputs.runtime }}
+      RUNTIME_VERSION: ${{ inputs.runtime-version }}
+      WORKDIR: ${{ inputs.workdir }}
+      IMAGES: ${{ inputs.images }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          case "$RUNTIME" in
+            node|python)
+              if [ -z "$RUNTIME_VERSION" ]; then
+                echo "::error::runtime-version is required when runtime is $RUNTIME"
+                exit 1
+              fi
+              ;;
+            none) ;;
+            *) echo "::error::runtime must be node, python or none (got: $RUNTIME)"; exit 1 ;;
+          esac
+          jq -e 'type == "array"' <<<"$IMAGES" >/dev/null || { echo "::error::images must be a JSON array"; exit 1; }
+
+      - name: Setup Node
+        if: inputs.runtime == 'node'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.runtime-version }}
+
+      - name: Setup Python
+        if: inputs.runtime == 'python'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.runtime-version }}
+
+      - name: Install
+        if: inputs.install-command != ''
+        working-directory: ${{ inputs.workdir }}
+        run: ${{ inputs.install-command }}
+
+      - name: Test
+        if: inputs.test-command != ''
+        working-directory: ${{ inputs.workdir }}
+        run: ${{ inputs.test-command }}
+
+      - name: Setup Buildx
+        if: env.IMAGES != '[]'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build images (no push)
+        if: env.IMAGES != '[]'
+        run: |
+          set -euo pipefail
+          while IFS= read -r img; do
+            name=$(jq -r '.name' <<<"$img")
+            context=$(jq -r '.context' <<<"$img")
+            dockerfile=$(jq -r '.dockerfile' <<<"$img")
+            args=()
+            while IFS= read -r ba; do
+              if [ -n "$ba" ]; then args+=(--build-arg "$ba"); fi
+            done < <(jq -r '(."build-args" // "") | split("\n") | .[]' <<<"$img")
+            echo "::group::build ${name}"
+            docker buildx build "$context" -f "$dockerfile" "${args[@]}" \
+              --cache-from "type=gha,scope=${name}" \
+              --cache-to "type=gha,scope=${name}" \
+              --output type=cacheonly </dev/null
+            echo "::endgroup::"
+          done < <(jq -c '.[]' <<<"$IMAGES")
