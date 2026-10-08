@@ -413,28 +413,21 @@ jobs:
           export PATH="$bindir:$PATH"
           acd=(argocd --server "$ARGOCD_SERVER" --plaintext --grpc-web --auth-token "$ARGOCD_AUTH_TOKEN")
 
+          # The root app (homelab-apps) auto-syncs; a refresh normally starts that sync.
+          # An explicit sync is only a nudge: "operation already in progress" means
+          # auto-sync is already applying our commit, which is what we want.
           "${acd[@]}" app get homelab-apps --refresh >/dev/null
-          synced=0
-          for attempt in 1 2 3 4 5; do
-            if out=$("${acd[@]}" app sync homelab-apps --async 2>&1); then
-              synced=1
-              break
-            fi
-            echo "$out"
+          if ! out=$("${acd[@]}" app sync homelab-apps --async 2>&1); then
             if grep -qi 'another operation is already in progress' <<<"$out"; then
-              echo "homelab-apps busy (attempt ${attempt}); retrying in 10s"
-              sleep 10
+              echo "homelab-apps auto-sync already running; waiting for it to apply ${APP}"
             else
+              echo "$out"
               exit 1
             fi
-          done
-          if [ "$synced" != 1 ]; then
-            echo "::error::homelab-apps still busy after 5 attempts"
-            exit 1
           fi
 
           ok=0
-          for _ in $(seq 1 24); do
+          for _ in $(seq 1 120); do
             current=$("${acd[@]}" app get "$APP" -o json | jq -r '(.spec.source.kustomize.images // [])[]')
             missing=0
             while IFS=$'\t' read -r manifest new _; do
@@ -447,7 +440,7 @@ jobs:
             sleep 5
           done
           if [ "$ok" != 1 ]; then
-            echo "::error::ArgoCD did not pick up the new digests for ${APP} within 120s"
+            echo "::error::ArgoCD did not pick up the new digests for ${APP} within 600s"
             exit 1
           fi
 
