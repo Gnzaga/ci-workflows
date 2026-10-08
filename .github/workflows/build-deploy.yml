@@ -13,8 +13,10 @@
 # `production` environment, which is restricted to the deploy branch.
 #
 # Flow: buildx -> push ghcr.io/gnzaga/<name>:<sha> -> digests -> (deploy job)
-# write Harbor pull-cache refs to homelab.git (deployer App token) -> ArgoCD sync
-# and health wait.
+#   argocd:  write Harbor pull-cache refs to homelab.git (deployer App token)
+#            -> ArgoCD sync and health wait.
+#   komodo:  rewrite image lines in a compose file in homelab.git (deployer App
+#            token) -> Komodo DeployStack and wait for the Update to complete.
 name: build-deploy
 
 on:
@@ -39,11 +41,23 @@ on:
       argocd-server:
         description: "ArgoCD API server reachable from the runner (host:port)"
         type: string
-        default: argocd-server.argocd.svc
+        default: argocd-server.argocd.svc:80
       deploy-target:
-        description: "argocd: deploy job commits digests to homelab.git and syncs ArgoCD. none: build and push only (deploy job skipped)"
+        description: "argocd: deploy job commits digests to homelab.git and syncs ArgoCD. komodo: deploy job commits digests to a compose file in homelab.git and runs a Komodo DeployStack. none: build and push only (deploy job skipped)"
         type: string
         default: argocd
+      komodo-stack:
+        description: "Komodo stack name to deploy (required when deploy-target is komodo)"
+        type: string
+        default: ""
+      compose-file:
+        description: "Compose file path in homelab.git, e.g. stacks/fredo/toth-collection/compose.yml (required when deploy-target is komodo)"
+        type: string
+        default: ""
+      komodo-url:
+        description: "Komodo core API base URL reachable from the runner"
+        type: string
+        default: http://192.168.42.27:9120
 
 permissions:
   contents: read
@@ -59,6 +73,8 @@ jobs:
       APP: ${{ inputs.app }}
       IMAGES: ${{ inputs.images }}
       DEPLOY_TARGET: ${{ inputs.deploy-target }}
+      KOMODO_STACK: ${{ inputs.komodo-stack }}
+      COMPOSE_FILE: ${{ inputs.compose-file }}
       GHCR_OWNER: gnzaga
       REPO_SLUG: ${{ github.repository }}
       REPO_SHA: ${{ github.sha }}
@@ -76,7 +92,11 @@ jobs:
           [[ "$APP" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || { echo "::error::invalid app name: ${APP}"; exit 1; }
           case "$DEPLOY_TARGET" in
             argocd|none) ;;
-            *) echo "::error::deploy-target must be argocd or none (got: ${DEPLOY_TARGET})"; exit 1 ;;
+            komodo)
+              [ -n "$KOMODO_STACK" ] || { echo "::error::komodo-stack is required when deploy-target is komodo"; exit 1; }
+              [ -n "$COMPOSE_FILE" ] || { echo "::error::compose-file is required when deploy-target is komodo"; exit 1; }
+              ;;
+            *) echo "::error::deploy-target must be argocd, komodo or none (got: ${DEPLOY_TARGET})"; exit 1 ;;
           esac
           jq -e 'type == "array" and length > 0 and all(.[];
             (.name | type == "string" and test("^[a-z0-9]+([._-][a-z0-9]+)*$")) and
@@ -144,12 +164,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
-    if: inputs.deploy-target == 'argocd'
+    if: inputs.deploy-target == 'argocd' || inputs.deploy-target == 'komodo'
     needs: build
     runs-on: arc-${{ github.event.repository.name }}
     environment:
       name: production
-      url: https://argocd.gnzaga.com/applications/argocd/${{ inputs.app }}
+      url: ${{ inputs.deploy-target == 'komodo' && format('{0}/stacks', inputs.komodo-url) || format('https://argocd.gnzaga.com/applications/argocd/{0}', inputs.app) }}
     timeout-minutes: 30
     concurrency:
       group: deploy-${{ inputs.app }}
@@ -164,6 +184,9 @@ jobs:
       GHCR_OWNER: gnzaga
       HOMELAB_APP_FILE_TEMPLATE: ${{ inputs.homelab-app-file }}
       ARGOCD_SERVER: ${{ inputs.argocd-server }}
+      KOMODO_STACK: ${{ inputs.komodo-stack }}
+      COMPOSE_FILE: ${{ inputs.compose-file }}
+      KOMODO_URL: ${{ inputs.komodo-url }}
       REPO_NAME: ${{ github.event.repository.name }}
       REPO_SHA: ${{ github.sha }}
     steps:
@@ -202,6 +225,7 @@ jobs:
 
       - name: Commit digests to homelab
         id: commit
+        if: inputs.deploy-target == 'argocd'
         env:
           DEPLOYER_TOKEN: ${{ steps.deployer.outputs.token }}
         run: |
@@ -288,6 +312,7 @@ jobs:
           printf 'commit\t%s\n' "$(( $(date +%s) - t0 ))" >> "$RUNNER_TEMP/timings.tsv"
 
       - name: Sync ArgoCD and wait for health
+        if: inputs.deploy-target == 'argocd'
         env:
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
         run: |
@@ -304,7 +329,7 @@ jobs:
           echo "$sha  $bindir/argocd" | sha256sum -c -
           chmod 0755 "$bindir/argocd"
           export PATH="$bindir:$PATH"
-          acd=(argocd --server "$ARGOCD_SERVER" --grpc-web --insecure --auth-token "$ARGOCD_AUTH_TOKEN")
+          acd=(argocd --server "$ARGOCD_SERVER" --plaintext --grpc-web --auth-token "$ARGOCD_AUTH_TOKEN")
 
           "${acd[@]}" app get homelab-apps --refresh >/dev/null
           synced=0
@@ -348,10 +373,147 @@ jobs:
           "${acd[@]}" app wait "$APP" --sync --health --timeout 600
           printf 'argocd\t%s\n' "$(( $(date +%s) - t0 ))" >> "$RUNNER_TEMP/timings.tsv"
 
+      - name: Commit compose digests to homelab
+        id: compose-commit
+        if: inputs.deploy-target == 'komodo'
+        env:
+          DEPLOYER_TOKEN: ${{ steps.deployer.outputs.token }}
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          echo "::add-mask::${DEPLOYER_TOKEN}"
+
+          bindir="$RUNNER_TEMP/bin"
+          mkdir -p "$bindir"
+          YQ_VERSION=v4.54.1
+          if ! { command -v yq >/dev/null 2>&1 && yq --version 2>/dev/null | grep -q 'mikefarah/yq.*version v4'; }; then
+            base="https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}"
+            curl -fsSL -o "$bindir/yq" "$base/yq_linux_amd64"
+            curl -fsSL -o "$RUNNER_TEMP/yq-checksums" "$base/checksums"
+            sha=$(awk '$1 == "yq_linux_amd64" {print $19}' "$RUNNER_TEMP/yq-checksums")
+            [ -n "$sha" ] || { echo "::error::yq SHA-256 not found in checksums"; exit 1; }
+            echo "$sha  $bindir/yq" | sha256sum -c -
+            chmod 0755 "$bindir/yq"
+            export PATH="$bindir:$PATH"
+          fi
+
+          repo_dir="$RUNNER_TEMP/homelab"
+          git clone --depth 1 "https://x-access-token:${DEPLOYER_TOKEN}@github.com/Gnzaga/homelab.git" "$repo_dir"
+          cd "$repo_dir"
+          git config user.name "gnzaga-deployer[bot]"
+          git config user.email "noreply@github.com"
+
+          file="$COMPOSE_FILE"
+          if [ ! -f "$file" ]; then
+            echo "::error::${file} not found in homelab.git"
+            exit 1
+          fi
+
+          parts=()
+          while IFS=$'\t' read -r manifest new label; do
+            parts+=("$label")
+            export M="$manifest" NEW="$new"
+            # Image name with any @digest and :tag stripped, compared exactly.
+            matches=$(yq '[.services[] | select(((.image // "") | sub("@.*$"; "") | sub(":[^/:]+$"; "")) == strenv(M))] | length' "$file")
+            if [ "$matches" = 0 ]; then
+              echo "::error::no service in ${file} uses image ${M}"
+              exit 1
+            fi
+            yq -i '
+              with(.services[] | select(((.image // "") | sub("@.*$"; "") | sub(":[^/:]+$"; "")) == strenv(M));
+                .image = strenv(NEW)
+              )' "$file"
+            echo "${matches} service(s) in ${file} set to ${NEW}"
+          done < "$RUNNER_TEMP/refs.tsv"
+
+          if git diff --quiet -- "$file"; then
+            echo "No digest change for ${KOMODO_STACK}; nothing to commit"
+          else
+            git add -- "$file"
+            joined=""
+            for p in "${parts[@]}"; do joined+="${joined:+, }${p}"; done
+            msg="deploy(${KOMODO_STACK}): ${joined} from ${REPO_NAME}@${REPO_SHA:0:7}"
+            git commit -q -m "$msg"
+            branch=$(git rev-parse --abbrev-ref HEAD)
+            pushed=0
+            for attempt in 1 2 3; do
+              if git push -q origin "HEAD:refs/heads/${branch}"; then
+                pushed=1
+                break
+              fi
+              echo "push attempt ${attempt} rejected; rebasing onto origin/${branch}"
+              if ! git pull -q --rebase origin "$branch"; then
+                git rebase --abort 2>/dev/null || true
+                echo "::error::rebase onto origin/${branch} failed"
+                exit 1
+              fi
+            done
+            if [ "$pushed" != 1 ]; then
+              echo "::error::push to homelab failed after 3 attempts"
+              exit 1
+            fi
+          fi
+
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          printf 'commit\t%s\n' "$(( $(date +%s) - t0 ))" >> "$RUNNER_TEMP/timings.tsv"
+
+      - name: Deploy via Komodo and wait for Update
+        if: inputs.deploy-target == 'komodo'
+        env:
+          KOMODO_KEY: ${{ secrets.KOMODO_KEY }}
+          KOMODO_SECRET: ${{ secrets.KOMODO_SECRET }}
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+
+          komodo() {
+            curl -sS --fail-with-body --max-time 60 -X POST "${KOMODO_URL}/$1" \
+              -H 'Content-Type: application/json' \
+              -H "X-API-KEY: ${KOMODO_KEY}" \
+              -H "X-API-SECRET: ${KOMODO_SECRET}" \
+              -d "$2"
+          }
+
+          if ! resp=$(komodo execute "$(jq -nc --arg s "$KOMODO_STACK" '{type: "DeployStack", params: {stack: $s}}')"); then
+            echo "::error::Komodo execute DeployStack failed for ${KOMODO_STACK}"
+            head -c 2000 <<<"$resp"
+            exit 1
+          fi
+          id=$(jq -r 'if (._id | type) == "object" then ._id["$oid"] else (._id // .id // empty) end' <<<"$resp")
+          if [ -z "$id" ] || [ "$id" = null ]; then
+            echo "::error::DeployStack response carried no Update id"
+            head -c 2000 <<<"$resp"
+            exit 1
+          fi
+          echo "Komodo Update ${id} started for stack ${KOMODO_STACK}"
+
+          deadline=$(( $(date +%s) + 600 ))
+          status=""
+          while :; do
+            upd=$(komodo read "$(jq -nc --arg id "$id" '{type: "GetUpdate", params: {id: $id}}')" 2>/dev/null) || upd=""
+            status=$(jq -r '.status // empty' <<<"$upd" 2>/dev/null || true)
+            if [ "$status" = "Complete" ]; then
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Komodo Update ${id} did not complete within 10 minutes (last status: ${status:-unknown})"
+              exit 1
+            fi
+            sleep 5
+          done
+
+          success=$(jq -r '.success' <<<"$upd")
+          if [ "$success" != true ]; then
+            echo "::error::Komodo Update ${id} for ${KOMODO_STACK} finished with success=${success}"
+            jq -c '(.logs // [])[] | {stage, success, stderr: ((.stderr // "")[0:2000])}' <<<"$upd" || true
+            exit 1
+          fi
+          printf 'komodo\t%s\n' "$(( $(date +%s) - t0 ))" >> "$RUNNER_TEMP/timings.tsv"
+
       - name: Job summary
         if: always()
         env:
-          HOMELAB_COMMIT: ${{ steps.commit.outputs.sha }}
+          HOMELAB_COMMIT: ${{ steps.commit.outputs.sha || steps.compose-commit.outputs.sha }}
         run: |
           {
             echo "## Deploy ${APP}"

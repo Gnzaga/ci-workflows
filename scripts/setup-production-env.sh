@@ -4,25 +4,28 @@
 #   - branch policy allowing <branch> to deploy to it
 #   - environment secrets sourced from Vault (values are never printed)
 #
-# Usage: setup-production-env.sh <repo> [branch=main] [--dry-run]
+# Usage: setup-production-env.sh <repo> [branch=main] [--komodo] [--dry-run]
 #
+# --komodo also sets KOMODO_KEY and KOMODO_SECRET from Vault deployments/komodo/ci-deployer.
 # A Vault path or field that is missing is skipped with a warning.
 # --dry-run prints the planned actions without calling GitHub or Vault.
 set -euo pipefail
 
 usage() {
-  sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-1}"
 }
 
 repo=""
 branch="main"
 dry_run=0
+komodo=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage 0 ;;
     --dry-run) dry_run=1; shift ;;
+    --komodo) komodo=1; shift ;;
     -*) echo "error: unknown flag $1" >&2; usage ;;
     *)
       if [ -z "$repo" ]; then repo="$1"
@@ -43,6 +46,13 @@ secret_map=(
   "DEPLOYER_PRIVATE_KEY github-apps/deployer private_key"
   "ARGOCD_AUTH_TOKEN argocd/ci-deployer token"
 )
+
+if [ "$komodo" = 1 ]; then
+  secret_map+=(
+    "KOMODO_KEY komodo/ci-deployer key"
+    "KOMODO_SECRET komodo/ci-deployer secret"
+  )
+fi
 
 if [ "$dry_run" = 1 ]; then
   echo "dry-run: no GitHub or Vault calls will be made"
