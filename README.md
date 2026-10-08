@@ -37,8 +37,21 @@ Required status check: `ci / ci`. Image JSON: `[{"name", "context", "dockerfile"
 ### `deploy-target`
 
 - `argocd` (default): the `deploy` job writes Harbor pull refs into the `app` Application file in homelab.git and syncs ArgoCD.
-- `komodo`: the `deploy` job rewrites the `image:` of every service in `compose-file` (in homelab.git) whose image matches the built image (`manifest-image`, or the pull-ref name when unset) to the new pull ref, commits and pushes, then runs Komodo `DeployStack` for `komodo-stack` and polls the resulting Update until it completes. Fails if a built image matches no service. Requires the `KOMODO_KEY` and `KOMODO_SECRET` production environment secrets.
+- `komodo`: the `deploy` job rewrites the `image:` of every service in `compose-file` (in homelab.git) whose image matches the built image (`manifest-image`, or the pull-ref name when unset) to the new pull ref, commits and pushes, then sends the committed file to Komodo with `UpdateStack` (`file_contents`), runs `DeployStack` for `komodo-stack` and polls the resulting Update until it completes. Fails if a built image matches no service. Requires the `KOMODO_KEY` and `KOMODO_SECRET` production environment secrets.
 - `none`: build and push only.
+
+### Homelab push fallback
+
+Both `argocd` and `komodo` commit to `main` of homelab.git. If the direct push is rejected by branch protection (stderr matches `protected branch`, `GH006` or `Required status check`), the deploy job falls back to a pull request:
+
+1. Pushes the commit to `deploy/<app>-<sha7>-<run_id>`, where `sha7` is the caller's commit.
+2. Opens a PR into `main` with the commit message as title and the run URL as body, then runs `gh pr merge --auto --merge --delete-branch`.
+3. Polls every 10 seconds for up to 10 minutes. It runs `gh pr update-branch` while the PR is `BEHIND`, and stops when the PR is `MERGED`. It fails on `CLOSED` or timeout.
+4. Uses the merge commit as the job's `sha` output. For `komodo`, the file pushed to Komodo is the merged content.
+
+The fallback needs the deployer App to have `Pull requests: write`. `gh` is not in the `ghcr.io/actions/actions-runner` image, so the deploy job installs a pinned `gh` release (SHA-256 checked) on first use. Auto-merge must be enabled on homelab.git.
+
+A bypass for the `gnzaga-deployer` App on homelab.git's `main` protection makes the fallback unnecessary: the direct push succeeds and no PR is created.
 
 Komodo caller example (values are illustrative):
 

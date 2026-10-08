@@ -18,7 +18,9 @@
 #   argocd:  write Harbor pull-cache refs to homelab.git (deployer App token)
 #            -> ArgoCD sync and health wait.
 #   komodo:  rewrite image lines in a compose file in homelab.git (deployer App
-#            token) -> Komodo DeployStack and wait for the Update to complete.
+#            token) -> Komodo UpdateStack (file contents) -> DeployStack and wait for
+#            the Update to complete.
+#   Homelab pushes to a protected main fall back to a deploy/* PR that auto-merges.
 name: build-deploy
 
 on:
@@ -324,8 +326,12 @@ jobs:
             branch=$(git rev-parse --abbrev-ref HEAD)
             pushed=0
             for attempt in 1 2 3; do
-              if git push -q origin "HEAD:refs/heads/${branch}"; then
+              if push_err=$(git push origin "HEAD:refs/heads/${branch}" 2>&1); then
                 pushed=1
+                break
+              fi
+              echo "$push_err"
+              if grep -qiE 'protected branch|GH006|Required status check' <<<"$push_err"; then
                 break
               fi
               echo "push attempt ${attempt} rejected; rebasing onto origin/${branch}"
@@ -336,12 +342,55 @@ jobs:
               fi
             done
             if [ "$pushed" != 1 ]; then
-              echo "::error::push to homelab failed after 3 attempts"
-              exit 1
+              if ! grep -qiE 'protected branch|GH006|Required status check' <<<"${push_err:-}"; then
+                echo "::error::push to homelab failed after 3 attempts"
+                exit 1
+              fi
+              echo "::notice::direct push to ${branch} blocked by branch protection; opening a pull request"
+              if ! command -v gh >/dev/null 2>&1; then
+                GH_VERSION=2.101.0
+                GH_SHA256=9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8
+                curl -fsSL -o "$RUNNER_TEMP/gh.tar.gz" "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+                echo "${GH_SHA256}  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+                tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP" "gh_${GH_VERSION}_linux_amd64/bin/gh"
+                install -m 0755 "$RUNNER_TEMP/gh_${GH_VERSION}_linux_amd64/bin/gh" "$bindir/gh"
+                export PATH="$bindir:$PATH"
+              fi
+              export GH_TOKEN="$DEPLOYER_TOKEN"
+              pr_branch="deploy/${APP}-${REPO_SHA:0:7}-${GITHUB_RUN_ID}"
+              git push -q origin "HEAD:refs/heads/${pr_branch}"
+              pr_url=$(gh pr create --repo Gnzaga/homelab --base "$branch" --head "$pr_branch" \
+                --title "$msg" --body "Deploy run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
+              gh pr merge "$pr_url" --auto --merge --delete-branch
+              deadline=$(( $(date +%s) + 600 ))
+              while :; do
+                pr=$(gh pr view "$pr_url" --json state,mergeStateStatus,mergeCommit)
+                state=$(jq -r '.state' <<<"$pr")
+                if [ "$state" = MERGED ]; then
+                  merged_sha=$(jq -r '.mergeCommit.oid // empty' <<<"$pr")
+                  break
+                fi
+                if [ "$state" = CLOSED ]; then
+                  echo "::error::${pr_url} was closed without merging"
+                  exit 1
+                fi
+                if [ "$(date +%s)" -ge "$deadline" ]; then
+                  echo "::error::${pr_url} not merged within 10 minutes (state: ${state}, merge state: $(jq -r '.mergeStateStatus' <<<"$pr"))"
+                  exit 1
+                fi
+                if [ "$(jq -r '.mergeStateStatus' <<<"$pr")" = BEHIND ]; then
+                  gh pr update-branch "$pr_url" || echo "::warning::update-branch failed; will retry"
+                fi
+                sleep 10
+              done
+              [ -n "$merged_sha" ] || { echo "::error::${pr_url} reported no merge commit"; exit 1; }
+              echo "Merged ${pr_url} as ${merged_sha}"
+              git fetch -q --depth 1 origin "$merged_sha"
+              git checkout -q "$merged_sha" -- "$file"
             fi
           fi
 
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "sha=${merged_sha:-$(git rev-parse HEAD)}" >> "$GITHUB_OUTPUT"
           printf 'commit\t%s\n' "$(( $(date +%s) - t0 ))" >> "$RUNNER_TEMP/timings.tsv"
 
       - name: Sync ArgoCD and wait for health
@@ -494,8 +543,12 @@ jobs:
             branch=$(git rev-parse --abbrev-ref HEAD)
             pushed=0
             for attempt in 1 2 3; do
-              if git push -q origin "HEAD:refs/heads/${branch}"; then
+              if push_err=$(git push origin "HEAD:refs/heads/${branch}" 2>&1); then
                 pushed=1
+                break
+              fi
+              echo "$push_err"
+              if grep -qiE 'protected branch|GH006|Required status check' <<<"$push_err"; then
                 break
               fi
               echo "push attempt ${attempt} rejected; rebasing onto origin/${branch}"
@@ -506,12 +559,55 @@ jobs:
               fi
             done
             if [ "$pushed" != 1 ]; then
-              echo "::error::push to homelab failed after 3 attempts"
-              exit 1
+              if ! grep -qiE 'protected branch|GH006|Required status check' <<<"${push_err:-}"; then
+                echo "::error::push to homelab failed after 3 attempts"
+                exit 1
+              fi
+              echo "::notice::direct push to ${branch} blocked by branch protection; opening a pull request"
+              if ! command -v gh >/dev/null 2>&1; then
+                GH_VERSION=2.101.0
+                GH_SHA256=9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8
+                curl -fsSL -o "$RUNNER_TEMP/gh.tar.gz" "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+                echo "${GH_SHA256}  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+                tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP" "gh_${GH_VERSION}_linux_amd64/bin/gh"
+                install -m 0755 "$RUNNER_TEMP/gh_${GH_VERSION}_linux_amd64/bin/gh" "$bindir/gh"
+                export PATH="$bindir:$PATH"
+              fi
+              export GH_TOKEN="$DEPLOYER_TOKEN"
+              pr_branch="deploy/${APP}-${REPO_SHA:0:7}-${GITHUB_RUN_ID}"
+              git push -q origin "HEAD:refs/heads/${pr_branch}"
+              pr_url=$(gh pr create --repo Gnzaga/homelab --base "$branch" --head "$pr_branch" \
+                --title "$msg" --body "Deploy run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
+              gh pr merge "$pr_url" --auto --merge --delete-branch
+              deadline=$(( $(date +%s) + 600 ))
+              while :; do
+                pr=$(gh pr view "$pr_url" --json state,mergeStateStatus,mergeCommit)
+                state=$(jq -r '.state' <<<"$pr")
+                if [ "$state" = MERGED ]; then
+                  merged_sha=$(jq -r '.mergeCommit.oid // empty' <<<"$pr")
+                  break
+                fi
+                if [ "$state" = CLOSED ]; then
+                  echo "::error::${pr_url} was closed without merging"
+                  exit 1
+                fi
+                if [ "$(date +%s)" -ge "$deadline" ]; then
+                  echo "::error::${pr_url} not merged within 10 minutes (state: ${state}, merge state: $(jq -r '.mergeStateStatus' <<<"$pr"))"
+                  exit 1
+                fi
+                if [ "$(jq -r '.mergeStateStatus' <<<"$pr")" = BEHIND ]; then
+                  gh pr update-branch "$pr_url" || echo "::warning::update-branch failed; will retry"
+                fi
+                sleep 10
+              done
+              [ -n "$merged_sha" ] || { echo "::error::${pr_url} reported no merge commit"; exit 1; }
+              echo "Merged ${pr_url} as ${merged_sha}"
+              git fetch -q --depth 1 origin "$merged_sha"
+              git checkout -q "$merged_sha" -- "$file"
             fi
           fi
 
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "sha=${merged_sha:-$(git rev-parse HEAD)}" >> "$GITHUB_OUTPUT"
           printf 'commit\t%s\n' "$(( $(date +%s) - t0 ))" >> "$RUNNER_TEMP/timings.tsv"
 
       - name: Deploy via Komodo and wait for Update
@@ -531,12 +627,32 @@ jobs:
               -d "$2"
           }
 
+          # Komodo responses can carry raw control characters inside strings (compose logs),
+          # which jq rejects. Re-serialize through Python so jq only ever reads valid JSON.
+          kjson() {
+            python3 -I -c 'import json,sys; sys.stdout.write(json.dumps(json.loads(sys.stdin.read(), strict=False)))'
+          }
+
+          content="$RUNNER_TEMP/homelab/${COMPOSE_FILE}"
+          [ -f "$content" ] || { echo "::error::${COMPOSE_FILE} not found in the homelab checkout"; exit 1; }
+          if ! wresp=$(komodo write "$(jq -nc --arg s "$KOMODO_STACK" --rawfile c "$content" '{type: "UpdateStack", params: {id: $s, config: {file_contents: $c}}}')"); then
+            echo "::error::Komodo write UpdateStack failed for ${KOMODO_STACK}"
+            head -c 2000 <<<"$wresp"
+            exit 1
+          fi
+          err=$(kjson <<<"$wresp" | jq -r '.error // empty')
+          if [ -n "$err" ]; then
+            echo "::error::Komodo UpdateStack rejected for ${KOMODO_STACK}: ${err:0:2000}"
+            exit 1
+          fi
+          echo "Pushed ${COMPOSE_FILE} into Komodo stack ${KOMODO_STACK}"
+
           if ! resp=$(komodo execute "$(jq -nc --arg s "$KOMODO_STACK" '{type: "DeployStack", params: {stack: $s}}')"); then
             echo "::error::Komodo execute DeployStack failed for ${KOMODO_STACK}"
             head -c 2000 <<<"$resp"
             exit 1
           fi
-          id=$(jq -r 'if (._id | type) == "object" then ._id["$oid"] else (._id // .id // empty) end' <<<"$resp")
+          id=$(kjson <<<"$resp" | jq -r 'if (._id | type) == "object" then ._id["$oid"] else (._id // .id // empty) end')
           if [ -z "$id" ] || [ "$id" = null ]; then
             echo "::error::DeployStack response carried no Update id"
             head -c 2000 <<<"$resp"
@@ -548,7 +664,7 @@ jobs:
           status=""
           while :; do
             upd=$(komodo read "$(jq -nc --arg id "$id" '{type: "GetUpdate", params: {id: $id}}')" 2>/dev/null) || upd=""
-            status=$(jq -r '.status // empty' <<<"$upd" 2>/dev/null || true)
+            status=$(kjson <<<"$upd" 2>/dev/null | jq -r '.status // empty' 2>/dev/null || true)
             if [ "$status" = "Complete" ]; then
               break
             fi
@@ -559,10 +675,10 @@ jobs:
             sleep 5
           done
 
-          success=$(jq -r '.success' <<<"$upd")
+          success=$(kjson <<<"$upd" | jq -r '.success')
           if [ "$success" != true ]; then
             echo "::error::Komodo Update ${id} for ${KOMODO_STACK} finished with success=${success}"
-            jq -c '(.logs // [])[] | {stage, success, stderr: ((.stderr // "")[0:2000])}' <<<"$upd" || true
+            kjson <<<"$upd" | jq -c '(.logs // [])[] | {stage, success, stderr: ((.stderr // "")[0:2000])}' || true
             exit 1
           fi
           printf 'komodo\t%s\n' "$(( $(date +%s) - t0 ))" >> "$RUNNER_TEMP/timings.tsv"
