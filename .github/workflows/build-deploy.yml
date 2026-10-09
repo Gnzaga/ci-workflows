@@ -454,6 +454,11 @@ jobs:
               exit 1
             fi
           fi
+          # Wait for the sync operation itself to finish first: right after an async
+          # sync the app can still report the OLD state as Healthy (seen with
+          # Recreate-strategy deployments), so a bare health wait passes too early.
+          "${acd[@]}" app wait "$APP" --operation --timeout 600
+          sleep 5
           "${acd[@]}" app wait "$APP" --sync --health --timeout 600
           printf 'argocd\t%s\n' "$(( $(date +%s) - t0 ))" >> "$RUNNER_TEMP/timings.tsv"
 
@@ -487,6 +492,11 @@ jobs:
               exit 1
             fi
           fi
+          # Wait for the sync operation itself to finish first: right after an async
+          # sync the app can still report the OLD state as Healthy (seen with
+          # Recreate-strategy deployments), so a bare health wait passes too early.
+          "${acd[@]}" app wait "$APP" --operation --timeout 600
+          sleep 5
           "${acd[@]}" app wait "$APP" --sync --health --timeout 600
           printf 'argocd\t%s\n' "$(( $(date +%s) - t0 ))" >> "$RUNNER_TEMP/timings.tsv"
 
