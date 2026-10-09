@@ -45,6 +45,8 @@ secret_map=(
   "DEPLOYER_APP_ID github-apps/deployer app_id"
   "DEPLOYER_PRIVATE_KEY github-apps/deployer private_key"
   "ARGOCD_AUTH_TOKEN argocd/ci-deployer token"
+  "HARBOR_PULL_USERNAME harbor/k8s-pull username"
+  "HARBOR_PULL_PASSWORD harbor/k8s-pull password"
 )
 
 if [ "$komodo" = 1 ]; then

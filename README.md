@@ -84,6 +84,17 @@ jobs:
 
 `komodo-url` defaults to `http://192.168.42.27:9120`.
 
+### Harbor pull-cache warm-up
+
+Harbor's proxy-cache project (`ghcr` for `harbor.gnzaga.com/ghcr/gnzaga/<name>`) fetches a layer from GHCR on its first request. A first pull of a large layer can end early in containerd (`short read ... unexpected EOF`) while Harbor is still caching, and the pod then sits in ImagePullBackOff past the progress deadline. To avoid this, the `deploy` job warms the cache before any homelab commit:
+
+1. Runs right after the `Map built images to pull refs` step and skips in deploy-only mode (`images: '[]'`).
+2. Installs `crane` v0.22.1 (SHA-256 checked) into `$RUNNER_TEMP/bin`.
+3. Logs in to `harbor.gnzaga.com` with the `HARBOR_PULL_USERNAME` and `HARBOR_PULL_PASSWORD` production environment secrets. The login is scoped to a step-local docker config. If either secret is empty, it emits a `::warning::` and skips the warm-up without failing the job.
+4. Runs `crane pull --format=oci` for each new pull ref. Each ref gets up to 6 attempts with backoff of 10, 20, 30, 45 and 60 seconds. The job fails if all attempts for a ref fail. Per-image seconds are printed, and the total is recorded in the job summary timings as `warm-cache`.
+
+`setup-production-env.sh` sets both secrets from Vault `deployments/harbor/k8s-pull` (`username`, `password`).
+
 ### Manual promotion (`homelab-auto-merge: false`)
 
 Default is `true`: the deploy job lands digests on homelab main (or through the fallback PR above) and then syncs ArgoCD or runs the Komodo deploy.
@@ -164,4 +175,4 @@ Both deploy jobs use the `production` environment, so they can run in the same w
 Run locally with `gh` authenticated as Gnzaga. `setup-production-env.sh` also needs `vault`. Both accept `--dry-run`, which makes no calls.
 
 - `scripts/apply-ruleset.sh <repo> [branch=main] [--bypass-app-id <id>]`: idempotent `deploy-branch` ruleset.
-- `scripts/setup-production-env.sh <repo> [branch=main] [--komodo]`: idempotent `production` environment, branch policy, and the three Vault-sourced secrets (`DEPLOYER_APP_ID`, `DEPLOYER_PRIVATE_KEY`, `ARGOCD_AUTH_TOKEN`). `--komodo` also sets `KOMODO_KEY` and `KOMODO_SECRET` from Vault `deployments/komodo/ci-deployer` (`key`, `secret`).
+- `scripts/setup-production-env.sh <repo> [branch=main] [--komodo]`: idempotent `production` environment, branch policy, and the five Vault-sourced secrets (`DEPLOYER_APP_ID`, `DEPLOYER_PRIVATE_KEY`, `ARGOCD_AUTH_TOKEN`, `HARBOR_PULL_USERNAME`, `HARBOR_PULL_PASSWORD` from Vault `deployments/harbor/k8s-pull`). `--komodo` also sets `KOMODO_KEY` and `KOMODO_SECRET` from Vault `deployments/komodo/ci-deployer` (`key`, `secret`).

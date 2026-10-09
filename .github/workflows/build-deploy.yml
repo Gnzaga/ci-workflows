@@ -253,6 +253,63 @@ jobs:
           done < <(jq -c '.[]' <<<"$IMAGES")
           cat "$refs"
 
+      - name: Warm Harbor pull-through cache
+        if: inputs.images != '[]'
+        env:
+          HARBOR_PULL_USERNAME: ${{ secrets.HARBOR_PULL_USERNAME }}
+          HARBOR_PULL_PASSWORD: ${{ secrets.HARBOR_PULL_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HARBOR_PULL_USERNAME" ] || [ -z "$HARBOR_PULL_PASSWORD" ]; then
+            echo "::warning::HARBOR_PULL_USERNAME/HARBOR_PULL_PASSWORD not set; skipping Harbor cache warm-up"
+            exit 0
+          fi
+
+          bindir="$RUNNER_TEMP/bin"
+          mkdir -p "$bindir"
+          CRANE_VERSION=v0.22.1
+          CRANE_SHA256=0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+          curl -fsSL -o "$RUNNER_TEMP/crane.tar.gz" "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  $RUNNER_TEMP/crane.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$bindir" crane
+          chmod 0755 "$bindir/crane"
+          export PATH="$bindir:$PATH"
+
+          # Scope registry credentials to this step's own docker config.
+          export DOCKER_CONFIG="$RUNNER_TEMP/docker-warm"
+          mkdir -p "$DOCKER_CONFIG"
+          printf '%s' "$HARBOR_PULL_PASSWORD" | crane auth login harbor.gnzaga.com -u "$HARBOR_PULL_USERNAME" --password-stdin
+
+          delays=(10 20 30 45 60)
+          max_attempts=6
+          t0=$(date +%s)
+          n=0
+          while IFS=$'\t' read -r _ ref _; do
+            n=$((n + 1))
+            dir="$RUNNER_TEMP/warm-${n}"
+            ti=$(date +%s)
+            ok=0
+            for attempt in $(seq 1 "$max_attempts"); do
+              rm -rf "$dir"
+              if crane pull --format=oci "$ref" "$dir"; then
+                ok=1
+                break
+              fi
+              if [ "$attempt" -lt "$max_attempts" ]; then
+                delay=${delays[$((attempt - 1))]}
+                echo "::warning::crane pull attempt ${attempt}/${max_attempts} failed for ${ref}; retrying in ${delay}s"
+                sleep "$delay"
+              fi
+            done
+            if [ "$ok" != 1 ]; then
+              echo "::error::Harbor cache warm-up failed for ${ref} after ${max_attempts} attempts"
+              exit 1
+            fi
+            rm -rf "$dir"
+            echo "warmed ${ref} in $(( $(date +%s) - ti ))s"
+          done < "$RUNNER_TEMP/refs.tsv"
+          printf 'warm-cache\t%s\n' "$(( $(date +%s) - t0 ))" >> "$RUNNER_TEMP/timings.tsv"
+
       - name: Mint deployer token
         id: deployer
         if: inputs.images != '[]'
