@@ -407,7 +407,7 @@ jobs:
               # never enables auto-merge, never waits.
               install_gh
               export GH_TOKEN="$DEPLOYER_TOKEN"
-              pr_branch="deploy/${APP}-${REPO_SHA:0:7}-${GITHUB_RUN_ID}"
+              pr_branch="deploy/${APP}-argocd-${REPO_SHA:0:7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
               git push -q origin "HEAD:refs/heads/${pr_branch}"
               pr_url=$(gh pr create --repo Gnzaga/homelab --base "$branch" --head "$pr_branch" \
                 --title "$msg" --body "Manual promotion (homelab-auto-merge: false). Merging this PR deploys ${APP}. Deploy run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
@@ -439,7 +439,7 @@ jobs:
                 echo "::notice::direct push to ${branch} blocked by branch protection; opening a pull request"
                 install_gh
                 export GH_TOKEN="$DEPLOYER_TOKEN"
-                pr_branch="deploy/${APP}-${REPO_SHA:0:7}-${GITHUB_RUN_ID}"
+                pr_branch="deploy/${APP}-argocd-${REPO_SHA:0:7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
                 git push -q origin "HEAD:refs/heads/${pr_branch}"
                 fb_url=$(gh pr create --repo Gnzaga/homelab --base "$branch" --head "$pr_branch" \
                   --title "$msg" --body "Deploy run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
@@ -667,7 +667,7 @@ jobs:
               # never enables auto-merge, never waits.
               install_gh
               export GH_TOKEN="$DEPLOYER_TOKEN"
-              pr_branch="deploy/${KOMODO_STACK}-${REPO_SHA:0:7}-${GITHUB_RUN_ID}"
+              pr_branch="deploy/${KOMODO_STACK}-komodo-${REPO_SHA:0:7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
               git push -q origin "HEAD:refs/heads/${pr_branch}"
               pr_url=$(gh pr create --repo Gnzaga/homelab --base "$branch" --head "$pr_branch" \
                 --title "$msg" --body "Manual promotion (homelab-auto-merge: false). Merging this PR deploys ${KOMODO_STACK}. Deploy run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
@@ -699,7 +699,7 @@ jobs:
                 echo "::notice::direct push to ${branch} blocked by branch protection; opening a pull request"
                 install_gh
                 export GH_TOKEN="$DEPLOYER_TOKEN"
-                pr_branch="deploy/${KOMODO_STACK}-${REPO_SHA:0:7}-${GITHUB_RUN_ID}"
+                pr_branch="deploy/${KOMODO_STACK}-komodo-${REPO_SHA:0:7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
                 git push -q origin "HEAD:refs/heads/${pr_branch}"
                 fb_url=$(gh pr create --repo Gnzaga/homelab --base "$branch" --head "$pr_branch" \
                   --title "$msg" --body "Deploy run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
