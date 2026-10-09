@@ -444,7 +444,16 @@ jobs:
             exit 1
           fi
 
-          "${acd[@]}" app sync "$APP"
+          # Child apps auto-sync too; "operation already in progress" means ArgoCD is
+          # already rolling out our change, so just wait for it.
+          if ! out=$("${acd[@]}" app sync "$APP" --async 2>&1); then
+            if grep -qi 'another operation is already in progress' <<<"$out"; then
+              echo "${APP} auto-sync already running; waiting for health"
+            else
+              echo "$out"
+              exit 1
+            fi
+          fi
           "${acd[@]}" app wait "$APP" --sync --health --timeout 600
           printf 'argocd\t%s\n' "$(( $(date +%s) - t0 ))" >> "$RUNNER_TEMP/timings.tsv"
 
@@ -468,7 +477,16 @@ jobs:
           export PATH="$bindir:$PATH"
           acd=(argocd --server "$ARGOCD_SERVER" --plaintext --grpc-web --auth-token "$ARGOCD_AUTH_TOKEN")
 
-          "${acd[@]}" app sync "$APP"
+          # Child apps auto-sync too; "operation already in progress" means ArgoCD is
+          # already rolling out our change, so just wait for it.
+          if ! out=$("${acd[@]}" app sync "$APP" --async 2>&1); then
+            if grep -qi 'another operation is already in progress' <<<"$out"; then
+              echo "${APP} auto-sync already running; waiting for health"
+            else
+              echo "$out"
+              exit 1
+            fi
+          fi
           "${acd[@]}" app wait "$APP" --sync --health --timeout 600
           printf 'argocd\t%s\n' "$(( $(date +%s) - t0 ))" >> "$RUNNER_TEMP/timings.tsv"
 
