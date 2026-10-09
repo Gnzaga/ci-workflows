@@ -71,6 +71,32 @@ jobs:
 
 `komodo-url` defaults to `http://192.168.42.27:9120`.
 
+### Manual promotion (`homelab-auto-merge: false`)
+
+Default is `true`: the deploy job lands digests on homelab main (or through the fallback PR above) and then syncs ArgoCD or runs the Komodo deploy.
+
+With `homelab-auto-merge: false` the deploy job never writes homelab main and never enables auto-merge:
+
+1. Pushes the digest commit to `deploy/<app>-<sha7>-<run_id>` and opens a homelab PR into `main` for it. Requires the deployer App to have `Pull requests: write`.
+2. Does not wait for the PR. Writes the PR URL to the job summary and to the step output `pr_url` of the commit step, and sets the `production` environment URL to that PR when the expression resolves (the environment URL falls back to the ArgoCD or Komodo URL otherwise).
+3. Skips the ArgoCD sync and health steps, and the Komodo `UpdateStack` and `DeployStack` steps. The app deploys when the PR is merged. Merging the PR is the deploy gate.
+
+If the source has no digest change, the job reports that and opens no PR.
+
+Caller example (sig-7 staging, ArgoCD app `sig7-staging`, app file `sig7.yaml` in homelab.git):
+
+```yaml
+jobs:
+  deploy:
+    uses: Gnzaga/ci-workflows/.github/workflows/build-deploy.yml@main
+    with:
+      app: sig7-staging
+      homelab-app-file: deployment-library/k8s/gitops/apps/sig7.yaml
+      homelab-auto-merge: false
+      images: '[{"name": "sig7-web", "context": ".", "dockerfile": "Dockerfile", "manifest-image": "harbor.gnzaga.com/apps/sig7-web"}, {"name": "sig7-worker", "context": ".", "dockerfile": "Dockerfile.worker", "manifest-image": "harbor.gnzaga.com/apps/sig7-worker"}]'
+    secrets: inherit
+```
+
 ### Deploy-only mode
 
 `images: '[]'` with `deploy-target: argocd` skips the build and the homelab commit. The deploy job only runs `argocd app sync <app>` and `app wait --sync --health`, so the Application gets a GitHub Deployment and a health result without pushing images. Use it for manifest-only repos. `[]` is rejected with any other deploy target, and when `prebuilt-digests` is set.
@@ -118,6 +144,7 @@ Both deploy jobs use the `production` environment, so they can run in the same w
 | normal komodo | non-empty | empty | `komodo` | run | runs | compose file | `DeployStack`, poll Update |
 | prebuilt | non-empty | set | `argocd` or `komodo` | skipped | runs with passthrough digests | as above | as above |
 | deploy-only | `[]` | empty | `argocd` | skipped | runs | none | `app sync`, `app wait` |
+| manual promotion (`homelab-auto-merge: false`) | non-empty | empty or set | `argocd` or `komodo` | as above | runs | PR only, not merged | none |
 
 ## Operator scripts
 
