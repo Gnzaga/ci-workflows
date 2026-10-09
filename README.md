@@ -5,7 +5,7 @@ Shared reusable GitHub Actions workflows and operator scripts for Gnzaga homelab
 ## Trust model
 | Workflow | Job | Runner | Code trust | Secrets |
 | --- | --- | --- | --- | --- |
-| `pr-ci.yml` | `ci` | GitHub-hosted `ubuntu-latest` | untrusted (PR code) | none |
+| `pr-ci.yml` | `ci` | GitHub-hosted `ubuntu-latest` | untrusted (PR code) | none; `GITHUB_TOKEN` (`packages: read`) only when `ghcr-login: true` |
 | `build-deploy.yml` | `build` | GitHub-hosted `ubuntu-latest` | merged code only | `GITHUB_TOKEN` (push to GHCR) |
 | `build-deploy.yml` | `deploy` | ARC `arc-<repo>` (in-cluster) | merged code only | `production` env |
 
@@ -31,6 +31,19 @@ jobs:
 ```
 
 Required status check: `ci / ci`. Image JSON: `[{"name", "context", "dockerfile", "build-args", "manifest-image"}]`. `name` is the GHCR package under `ghcr.io/gnzaga/`, `context` and `dockerfile` are relative to the repo root, `build-args` is newline-separated `K=V`, and `manifest-image` is the image name as written in the app manifests (optional). Build-only callers pass `deploy-target: none`, which skips the `deploy` job.
+
+### `ghcr-login` (pr-ci)
+
+`ghcr-login: true` logs in to `ghcr.io` with `GITHUB_TOKEN` (`packages: read`) before the image build checks, so a Dockerfile can `FROM` a private GHCR image. Default `false`. PR code runs in the same job, so the token is available to its build; only enable it for repos whose PRs are trusted to read the org's packages.
+
+```yaml
+jobs:
+  ci:
+    uses: Gnzaga/ci-workflows/.github/workflows/pr-ci.yml@v1
+    with:
+      ghcr-login: true
+      images: '[...]'
+```
 
 `argocd-server` defaults to `argocd-server.argocd.svc:80`. The in-cluster server runs with `server.insecure=true`, so the CLI uses `--plaintext`.
 

@@ -1,7 +1,8 @@
 # Reusable PR CI workflow.
 #
 # Trust model: runs untrusted code (pull request heads, agent-authored branches)
-# on GitHub-hosted runners. No secrets are referenced in this file. Images are
+# on GitHub-hosted runners. The only credential is GITHUB_TOKEN, and only when
+# ghcr-login is true (packages: read, passed to docker/login-action). Images are
 # built for verification only and are never pushed.
 #
 # Caller job id must be `ci` so the required status check is `ci / ci`.
@@ -34,6 +35,10 @@ on:
         description: 'JSON list: [{"name","context","dockerfile","build-args"}]; paths relative to repo root'
         type: string
         default: "[]"
+      ghcr-login:
+        description: "true: log in to ghcr.io with GITHUB_TOKEN (packages: read) before the image build checks, so Dockerfiles can pull GHCR images"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -44,6 +49,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+      packages: read
     env:
       RUNTIME: ${{ inputs.runtime }}
       RUNTIME_VERSION: ${{ inputs.runtime-version }}
@@ -95,6 +101,14 @@ jobs:
       - name: Setup Buildx
         if: env.IMAGES != '[]'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        if: inputs.ghcr-login
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build images (no push)
         if: env.IMAGES != '[]'
