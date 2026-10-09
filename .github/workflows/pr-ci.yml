@@ -40,16 +40,13 @@ on:
         type: boolean
         default: false
 
-permissions:
-  contents: read
-
+# No permissions block: a reusable workflow cannot exceed its caller's grant, and
+# requesting more (e.g. packages: read) makes callers that grant only contents: read
+# fail with startup_failure. Callers set permissions; use packages: read with ghcr-login.
 jobs:
   ci:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    permissions:
-      contents: read
-      packages: read
     env:
       RUNTIME: ${{ inputs.runtime }}
       RUNTIME_VERSION: ${{ inputs.runtime-version }}
